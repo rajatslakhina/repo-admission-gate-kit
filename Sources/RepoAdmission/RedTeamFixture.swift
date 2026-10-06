@@ -47,6 +47,9 @@ public enum RedTeamFixture {
     /* Decoy, nested: /* .macro(name: "Ghost") */ still a comment */
 
     let decoy = "Process(\\"not a call\\") .plugin(name: \\"Ghost\\", capability: .buildTool())"
+    // A bare regex holding a lone quote must not swallow the rest of the line.
+    let quote = /"/; let cwd = FileManager.default.currentDirectoryPath
+    let ratio = 10 / 2 // division is not a regex
     let env = ProcessInfo.processInfo.environment["CI"] != nil
 
     let package = Package(
@@ -54,6 +57,7 @@ public enum RedTeamFixture {
         dependencies: [
             .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0"),
             .package(url: "https://github.com/example/codegen-tools", branch: "main"),
+            .package(id: "acme.telemetry", from: "1.0.0"),
             .package(path: "../SharedKit"),
         ],
         targets: [
@@ -67,6 +71,7 @@ public enum RedTeamFixture {
                 plugins: [.plugin(name: "Codegen", package: "codegen-tools")]
             ),
             .binaryTarget(name: "Analytics", url: "https://example.com/Analytics.xcframework.zip", checksum: "abc123"),
+            .plugin (name: "SpacedLint", capability: .buildTool()),  // a space before "(" is legal Swift
         ]
     )
     """
@@ -119,6 +124,8 @@ public enum RedTeamFixture {
         \t\tAA0000000000000000000004 = {isa = PBXBuildRule; filePatterns = "*.proto"; script = "touch /tmp/redteam-build-rule"; };
         \t\tAA0000000000000000000005 /* Tool */ = {isa = PBXLegacyTarget; name = Tool; buildToolPath = /usr/bin/make; buildArgumentsString = "$(ACTION)"; };
         \t\tAA0000000000000000000006 /* Decoy: a comment saying isa = PBXShellScriptBuildPhase; is not one */ = {isa = PBXGroup; children = (); };
+        \t\tAA0000000000000000000008 /* Debug */ = {isa = XCBuildConfiguration; name = Debug; buildSettings = {SWIFT_VERSION = 6.0; OTHER_SWIFT_FLAGS = ("$(inherited)", "-load-plugin-executable", "/tmp/redteam-plugin#RedTeam"); }; };
+        \t\tAA0000000000000000000009 /* Release */ = {isa = XCBuildConfiguration; name = Release; buildSettings = {OTHER_SWIFT_FLAGS = "-warnings-as-errors"; }; };
         \t\tAA0000000000000000000007 = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/example/telemetry-kit.git"; requirement = {kind = upToNextMajorVersion; minimumVersion = 2.0.0; }; };
         \t};
         \trootObject = AA0000000000000000000001;
@@ -157,6 +164,7 @@ public enum RedTeamFixture {
             "App.xcodeproj/xcshareddata/xcschemes/App.xcscheme": scheme,
             "Sources/App/App.swift": "// .plugin(name: \"NotAManifest\", capability: .buildTool()) — not a manifest, never scanned\n",
             "README.md": "# App\n",
+            "Config/Base.xcconfig": "// Decoy below: an ordinary flag is not a vector.\nSWIFT_EXEC = /tmp/redteam-swift-exec\nOTHER_SWIFT_FLAGS = -warnings-as-errors\n",
         ])
     }
 
@@ -212,6 +220,11 @@ public enum RedTeamFixture {
         .init(vectorClass: .buildRule, subject: "*.proto [AA0000000000000000000004]"),
         .init(vectorClass: .legacyTarget, subject: "Tool [AA0000000000000000000005]"),
         .init(vectorClass: .schemeAction, subject: "App.xcscheme action #1"),
+        .init(vectorClass: .buildSetting, subject: "OTHER_SWIFT_FLAGS (Debug) [AA0000000000000000000008]"),
+        .init(vectorClass: .buildSetting, subject: "SWIFT_EXEC (Base.xcconfig:2)"),
+        .init(vectorClass: .remotePackage, subject: "acme.telemetry"),
+        .init(vectorClass: .buildToolPlugin, subject: "SpacedLint"),
+        .init(vectorClass: .manifestSideEffect, subject: "FileManager"),
     ]
 
     public struct Audit: Sendable, Equatable {

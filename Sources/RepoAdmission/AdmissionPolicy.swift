@@ -84,6 +84,7 @@ public struct AdmissionPolicy: Sendable, Equatable, Codable {
         .buildRule: .requireApproval,
         .legacyTarget: .requireApproval,
         .schemeAction: .requireApproval,
+        .buildSetting: .requireApproval,
         .unscannableControlFile: .requireApproval,
     ])
 
@@ -147,6 +148,7 @@ public struct AdmissionPolicy: Sendable, Equatable, Codable {
         case .buildRule: "a custom build rule script"
         case .legacyTarget: "an external build tool invocation"
         case .schemeAction: "a scheme pre/post action script"
+        case .buildSetting: "a build setting that swaps the compiler/linker or loads compiler plugins"
         case .unscannableControlFile: "a control file the scanner could not inspect"
         }
     }

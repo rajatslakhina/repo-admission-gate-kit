@@ -10,6 +10,7 @@ public final class ScanContext {
     public let limits: ScanLimits
     private let source: any RepoFileSource
     private var cache: [String: [UInt8]] = [:]
+    private var bytesRead = 0
     private(set) var problems: [ExecutionVector] = []
     private var reported = Set<String>()
 
@@ -35,13 +36,41 @@ public final class ScanContext {
 
     /// File text, or nil — with the reason recorded as an integrity finding.
     public func text(_ path: String) -> String? {
-        bytes(path).map { String(decoding: $0, as: UTF8.self) }
+        bytes(path).map(Self.normalizedText)
+    }
+
+    /// Decode as UTF-8, drop a leading BOM and turn CRLF into LF.
+    ///
+    /// Every line-based scanner works on this, because Swift's Character
+    /// treats "\r\n" as a single grapheme: without it a CRLF `.git/config`,
+    /// `Package.swift` or `.xcconfig` reads as one long line (and a `//` comment
+    /// on line 1 of a manifest swallows the whole file) — while git and SwiftPM
+    /// read them line by line and run what is in them. LF-only input is
+    /// unchanged, so line numbers still match the file on disk.
+    static func normalizedText(_ bytes: [UInt8]) -> String {
+        var view = String.UnicodeScalarView()
+        var scalars = String(decoding: bytes, as: UTF8.self).unicodeScalars[...]
+        if scalars.first == "\u{FEFF}" { scalars = scalars.dropFirst() }
+        var pendingCR = false
+        for scalar in scalars {
+            if pendingCR, scalar != "\n" { view.append("\r") }
+            pendingCR = scalar == "\r"
+            if !pendingCR { view.append(scalar) }
+        }
+        if pendingCR { view.append("\r") }
+        return String(view)
     }
 
     public func bytes(_ path: String) -> [UInt8]? {
         if let cached = cache[path] { return cached }
         do {
-            let value = try source.read(path, limit: limits.maxFileBytes)
+            let remaining = max(0, limits.maxTotalBytes - bytesRead)
+            guard remaining > 0 else {
+                reportProblem(path: path, detail: "scan byte budget (\(limits.maxTotalBytes) bytes in total) exhausted before this control file")
+                return nil
+            }
+            let value = try source.read(path, limit: min(limits.maxFileBytes, remaining))
+            bytesRead = Saturating.add(bytesRead, value.count)
             cache[path] = value
             return value
         } catch RepoReadError.tooLarge(_, let size, let limit) {
@@ -61,11 +90,64 @@ public final class ScanContext {
             payload: detail, firedBy: Set(Trigger.allCases)))
     }
 
-    // Parsed `.git/config`, computed once and shared by the config, hooks and
-    // attributes scanners (attributes are only dangerous if config defines the driver).
+    /// The git metadata directories inside the tree: `.git` when it is a
+    /// directory, or the in-tree target of a `.git` *file* (`gitdir: meta`),
+    /// plus the in-tree `commondir` either one names. A `.git` file is how
+    /// worktrees and submodules point at their metadata — and how a received
+    /// repository would hide its config from a scanner that only reads
+    /// `.git/config`.
+    public private(set) lazy var gitDirs: [String] = {
+        var bases: [String] = []
+        if entries.contains(where: { $0.path.hasPrefix(".git/") }) {
+            bases.append(".git")
+        } else if exists(".git"), let pointer = text(".git") {
+            let target = Self.gitdirTarget(pointer)
+            if !target.hasPrefix("/"), let normalized = PathText.normalize(target), !normalized.isEmpty {
+                bases.append(normalized)
+            }
+        }
+        var result = bases
+        for base in bases {
+            guard exists("\(base)/commondir"), let raw = text("\(base)/commondir") else { continue }
+            let value = raw.trimmingSpaces().split(separator: "\n").first.map(String.init) ?? ""
+            if !value.hasPrefix("/"), let normalized = PathText.normalize(PathText.join(base, value)),
+               !normalized.isEmpty, !result.contains(normalized) {
+                result.append(normalized)
+            }
+        }
+        return result
+    }()
+
+    /// `commondir` files whose target leaves the tree: (git dir, target).
+    var escapingCommonDirs: [(String, String)] {
+        gitDirs.compactMap { base in
+            guard exists("\(base)/commondir"), let raw = text("\(base)/commondir") else { return nil }
+            let value = raw.trimmingSpaces().split(separator: "\n").first.map(String.init) ?? ""
+            if value.hasPrefix("/") || PathText.normalize(PathText.join(base, value)) == nil { return (base, value) }
+            return nil
+        }
+    }
+
+    static func gitdirTarget(_ pointer: String) -> String {
+        pointer.replacingFirst("gitdir:", with: "").trimmingSpaces()
+            .split(separator: "\n").first.map { String($0).trimmingSpaces() } ?? ""
+    }
+
+    public func isInsideGitDir(_ path: String) -> Bool {
+        gitDirs.contains { path.hasPrefix("\($0)/") }
+    }
+
+    // Every config file in every git dir, parsed once and shared by the config,
+    // hooks and attributes scanners (attributes are only dangerous if config
+    // defines the driver).
     public private(set) lazy var gitConfig: [GitConfigEntry] = {
-        guard exists(".git/config"), let text = text(".git/config") else { return [] }
-        return GitConfigParser.parse(text)
+        gitDirs.flatMap { base in
+            ["config", "config.worktree"].flatMap { file -> [GitConfigEntry] in
+                let path = "\(base)/\(file)"
+                guard exists(path), let text = text(path) else { return [] }
+                return GitConfigParser.parse(text, source: path)
+            }
+        }
     }()
 }
 

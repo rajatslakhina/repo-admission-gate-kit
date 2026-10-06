@@ -12,6 +12,13 @@ public struct GitConfigEntry: Hashable, Sendable {
     public let value: String?
     /// 1-based lines this entry occupies (more than one with `\` continuations).
     public let lines: ClosedRange<Int>
+    /// Repo-relative path of the config file the entry came from.
+    public var source: String = ".git/config"
+    /// When the key shares its first line with a section header
+    /// (`[core] fsmonitor = x`), the character offset where the key starts —
+    /// so the sanitizer can cut the key without deleting the header. Counted in
+    /// Unicode scalars (after a leading BOM), not Characters.
+    public var keyColumn: Int?
 
     public var dottedKey: String {
         if let subsection { return "\(section).\(subsection).\(name)" }
@@ -19,17 +26,23 @@ public struct GitConfigEntry: Hashable, Sendable {
     }
 }
 
-/// A git-config parser that follows git's own rules closely enough that an
-/// attacker cannot hide a key from it with syntax git accepts: case-insensitive
+/// A git-config parser that follows the git syntax an attacker is most likely
+/// to use to hide a key — LF, CRLF and a leading BOM, case-insensitive
 /// sections and names, `[section "sub"]` and legacy `[section.sub]` headers,
 /// a key on the same line as its header, quoted values, `#`/`;` comments,
 /// backslash escapes and `\`-newline continuations.
 public enum GitConfigParser {
-    public static func parse(_ text: String) -> [GitConfigEntry] {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> [Character] in
-            var chars = Array(line)
-            if chars.last == "\r" { chars.removeLast() }
-            return chars
+    public static func parse(_ text: String, source: String = ".git/config") -> [GitConfigEntry] {
+        // Split on Unicode scalars, not Characters: "\r\n" is ONE grapheme
+        // cluster, so a Character-level split of a CRLF file returns the whole
+        // file as a single line — and every key in it disappears. Git itself
+        // accepts CRLF and skips a leading UTF-8 BOM, so this parser must too.
+        var scalars = Substring(text).unicodeScalars[...]
+        if scalars.first == "\u{FEFF}" { scalars = scalars.dropFirst() }
+        let lines = scalars.split(separator: "\n", omittingEmptySubsequences: false).map { line -> [Character] in
+            var view = String.UnicodeScalarView(line)
+            if view.last == "\r" { view.removeLast() }
+            return Array(String(view))
         }
         var entries: [GitConfigEntry] = []
         var section = ""
@@ -43,11 +56,14 @@ public enum GitConfigParser {
             guard cursor < line.count else { continue }
             if line[cursor] == "#" || line[cursor] == ";" { continue }
 
+            var keyColumn: Int?
             if line[cursor] == "[" {
                 guard let close = headerEnd(line, from: cursor + 1) else { continue }  // malformed: git errors, we skip
                 (section, subsection) = parseHeader(Array(line[(cursor + 1)..<close]))
                 cursor = skipSpaces(line, from: close + 1)
                 guard cursor < line.count, line[cursor] != "#", line[cursor] != ";" else { continue }
+                // Recorded in Unicode scalars, which is how the sanitizer cuts.
+                keyColumn = String(line[..<cursor]).unicodeScalars.count
             }
 
             // Variable name.
@@ -60,7 +76,7 @@ public enum GitConfigParser {
             cursor = skipSpaces(line, from: cursor)
             guard cursor < line.count, line[cursor] == "=" else {
                 entries.append(GitConfigEntry(section: section, subsection: subsection, name: name.lowercased(),
-                                              value: nil, lines: startLine...startLine))
+                                              value: nil, lines: startLine...startLine, source: source, keyColumn: keyColumn))
                 continue
             }
             cursor = skipSpaces(line, from: cursor + 1)
@@ -107,7 +123,7 @@ public enum GitConfigParser {
                 }
             }
             entries.append(GitConfigEntry(section: section, subsection: subsection, name: name.lowercased(),
-                                          value: value, lines: startLine...endLine))
+                                          value: value, lines: startLine...endLine, source: source, keyColumn: keyColumn))
         }
         return entries
     }
@@ -208,6 +224,13 @@ enum GitExecKeys {
             return isCommandValue ? (.gitConfigCommand, filterTriggers) : nil
         case ("merge", .some(_), "driver"):
             return isCommandValue ? (.gitConfigCommand, [.gitCommit, .gitCheckout]) : nil
+        case ("man", .some(_), "cmd"), ("man", .some(_), "path"), ("browser", .some(_), "cmd"), ("browser", .some(_), "path"):
+            // `git help` runs the configured man viewer / browser.
+            return isCommandValue ? (.gitConfigCommand, [.gitContentRender]) : nil
+        case ("gpg", "ssh", "defaultkeycommand"), ("trailer", .some(_), "command"), ("trailer", .some(_), "cmd"):
+            return isCommandValue ? (.gitConfigCommand, [.gitCommit]) : nil
+        case ("sendemail", _, let name) where name.hasSuffix("cmd") || name == "smtpserver":
+            return isCommandValue && (name.hasSuffix("cmd") || value.hasPrefix("/") || value.hasPrefix(".")) ? (.gitConfigCommand, [.gitNetwork]) : nil
         case ("alias", _, _) where value.hasPrefix("!"):
             // Aliases cannot shadow built-ins, so a shell alias only runs when
             // the agent invokes that alias name.
@@ -220,7 +243,10 @@ enum GitExecKeys {
     }
 }
 
-/// `.git/config`, and the `.git` *file* form that redirects git elsewhere.
+/// Every git config file git will read from the tree — `config` and
+/// `config.worktree` in `.git/`, in the in-tree directory a `.git` *file*
+/// points at, and in a `commondir` — and the redirect forms that point git
+/// outside the tree.
 public struct GitConfigScanner: VectorScanner {
     public let name = "git-config"
     public init() {}
@@ -241,17 +267,25 @@ public struct GitConfigScanner: VectorScanner {
             }
         }
 
+        // A `commondir` that leaves the tree: the shared config and hooks of a
+        // linked worktree live where this scan cannot see.
+        for (directory, target) in context.escapingCommonDirs {
+            vectors.append(ExecutionVector(
+                vectorClass: .gitDirRedirect, subject: "commondir → \(target)", path: "\(directory)/commondir",
+                lines: 1...1, payload: target, firedBy: Trigger.allGit))
+        }
+
         for entry in context.gitConfig {
             guard let (vectorClass, triggers) = GitExecKeys.classify(entry) else { continue }
             vectors.append(ExecutionVector(
-                vectorClass: vectorClass, subject: entry.dottedKey, path: ".git/config",
+                vectorClass: vectorClass, subject: entry.dottedKey, path: entry.source,
                 lines: entry.lines, payload: "\(entry.dottedKey) = \(entry.value ?? "")", firedBy: triggers))
         }
         return vectors
     }
 }
 
-/// Active hooks in `.git/hooks`, plus hooks in a tracked directory that
+/// Active hooks in every git directory's `hooks/`, plus hooks in a tracked directory that
 /// `core.hooksPath` points git at.
 public struct GitHooksScanner: VectorScanner {
     public let name = "git-hooks"
@@ -276,7 +310,7 @@ public struct GitHooksScanner: VectorScanner {
     }
 
     public func scan(_ context: ScanContext) -> [ExecutionVector] {
-        var directories = [".git/hooks"]
+        var directories = context.gitDirs.map { "\($0)/hooks" }
         if let hooksPath = context.gitConfig.last(where: { $0.section == "core" && $0.subsection == nil && $0.name == "hookspath" })?.value,
            !hooksPath.hasPrefix("/"), let normalized = PathText.normalize(hooksPath), !normalized.isEmpty {
             directories.append(normalized)
@@ -319,7 +353,8 @@ public struct GitAttributesScanner: VectorScanner {
     public func scan(_ context: ScanContext) -> [ExecutionVector] {
         var vectors: [ExecutionVector] = []
         let attributeFiles = context.files { path in
-            PathText.lastComponent(path) == ".gitattributes" && !path.hasPrefix(".git/") || path == ".git/info/attributes"
+            (PathText.lastComponent(path) == ".gitattributes" && !context.isInsideGitDir(path))
+                || context.gitDirs.contains { path == "\($0)/info/attributes" }
         }
         for path in attributeFiles {
             guard let text = context.text(path) else { continue }

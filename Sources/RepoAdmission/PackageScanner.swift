@@ -24,7 +24,12 @@ struct SwiftLexed {
     var literals: [String] = []
 
     init(_ source: String) {
-        let chars = Array(source)
+        // One Character per Unicode SCALAR, not per grapheme cluster. Swift's
+        // Character merges a combining mark into the quote before it
+        // ("\u{301}" after `"`), and "\r\n" into one unit — either one lets a
+        // manifest make the lexer misread where a string or comment ends and
+        // hide a `.plugin(` from the scan while SwiftPM still builds it.
+        let chars = source.unicodeScalars.map(Character.init)
         var i = 0
         lex(chars, &i, terminator: nil, depth: 0)
     }
@@ -37,6 +42,11 @@ struct SwiftLexed {
             let next = s[safe: i + 1]
             if let terminator, c == terminator, parens == 0 { return }
             if c == "(" { parens += 1 } else if c == ")" { parens = max(0, parens - 1) }
+            if c == "`" {
+                // Backtick-escaped identifier: `` Target.`plugin`( `` is `Target.plugin(`.
+                i += 1
+                continue
+            }
 
             if c == "/", next == "/" {
                 while i < s.count, s[i] != "\n" { i += 1 }
@@ -52,11 +62,36 @@ struct SwiftLexed {
                 code.append(" ")
                 continue
             }
+            if c == "/", let regexEnd = Self.bareRegexEnd(s, at: i, previous: code.last(where: { $0 != " " && $0 != "\t" })) {
+                // Swift 5.7+ bare regex literal `/…/`: its contents are not code,
+                // and an unbalanced quote inside one must not open a string.
+                literals.append(String(s[(i + 1)..<regexEnd]))
+                code.append(contentsOf: "\"§\(literals.count - 1)\"")
+                i = regexEnd + 1
+                continue
+            }
             if c == "#" || c == "\"" {
                 // Count raw-string hashes.
                 var hashes = 0
                 var j = i
                 while j < s.count, s[j] == "#" { hashes += 1; j += 1 }
+                if hashes > 0, j < s.count, s[j] == "/" {
+                    // Extended regex literal `#/…/#`, possibly multi-line.
+                    var k = j + 1
+                    var closed = false
+                    while k < s.count {
+                        if s[k] == "/" {
+                            var h = 0
+                            while h < hashes, s[safe: k + 1 + h] == "#" { h += 1 }
+                            if h == hashes { closed = true; break }
+                        }
+                        k += 1
+                    }
+                    literals.append(String(s[(j + 1)..<min(k, s.count)]))
+                    code.append(contentsOf: "\"§\(literals.count - 1)\"")
+                    i = closed ? k + 1 + hashes : s.count
+                    continue
+                }
                 if j < s.count, s[j] == "\"" {
                     i = j
                     let text = lexString(s, &i, hashes: hashes, depth: depth)
@@ -68,6 +103,22 @@ struct SwiftLexed {
             code.append(c)
             i += 1
         }
+    }
+
+    /// If `/` at `i` opens a bare regex literal, the index of its closing `/`.
+    /// Heuristic, as the compiler's is: it must follow an operator-ish
+    /// character (or start the code), must not start with whitespace, and must
+    /// close on the same line. Division (`a / b`, `x/2`) fails one of those.
+    static func bareRegexEnd(_ s: [Character], at i: Int, previous: Character?) -> Int? {
+        guard let first = s[safe: i + 1], first != " ", first != "\t", first != "\n", first != "/", first != "*" else { return nil }
+        if let previous, !"=(,:[{!&|?;".contains(previous) { return nil }
+        var k = i + 1
+        while k < s.count, s[k] != "\n" {
+            if s[k] == "\\" { k += 2; continue }
+            if s[k] == "/" { return k }
+            k += 1
+        }
+        return nil
     }
 
     /// `i` points at the opening quote. Returns literal text; leaves `i` after the close.
@@ -135,14 +186,24 @@ struct CallFinder {
     let code: [Character]
 
     /// Argument text of every call to `name` (e.g. ".plugin"), with balanced parens.
+    /// Whitespace between the name and `(` is allowed — `.macro (name: …)` is
+    /// legal Swift, and a scanner that needs `.macro(` is a scanner a manifest
+    /// can step around with one space.
     func arguments(of name: String) -> [String] {
-        let needle = Array(name + "(")
+        let needle = Array(name)
         var results: [String] = []
         var i = 0
         while i + needle.count <= code.count {
-            if code[i..<(i + needle.count)].elementsEqual(needle), isBoundary(before: i, name: name) {
+            var open = i + needle.count
+            let nameMatches = code[i..<(i + needle.count)].elementsEqual(needle)
+                && isBoundary(before: i, name: name)
+                && !(code[safe: open].map(Self.isIdentifierChar) ?? false)
+            if nameMatches {
+                while let c = code[safe: open], c == " " || c == "\t" || c == "\n" || c == "\r" { open += 1 }
+            }
+            if nameMatches, code[safe: open] == "(" {
                 var depth = 1
-                var j = i + needle.count
+                var j = open + 1
                 let start = j
                 while j < code.count, depth > 0 {
                     if code[j] == "(" { depth += 1 } else if code[j] == ")" { depth -= 1 }
@@ -201,7 +262,8 @@ public struct PackageManifestScanner: VectorScanner {
     public init() {}
 
     static let sideEffectAPIs = ["Process", "FileManager", "URLSession", "ProcessInfo", "getenv", "setenv",
-                                 "system", "popen", "dlopen", "fopen", "NSTask", "Pipe", "FileHandle"]
+                                 "system", "popen", "dlopen", "dlsym", "fopen", "NSTask", "Pipe", "FileHandle",
+                                 "posix_spawn", "posix_spawnp", "execv", "execve", "execvp", "fork", "contentsOf"]
     static let allowedImports: Set<String> = ["PackageDescription", "Foundation", "CompilerPluginSupport"]
     static let buildTriggers: Set<Trigger> = [.swiftPMBuild, .xcodeBuild]
     static let manifestTriggers: Set<Trigger> = [.manifestEvaluation, .packageResolution, .swiftPMBuild, .xcodeBuild]
@@ -231,7 +293,12 @@ public struct PackageManifestScanner: VectorScanner {
             vectors += scanTargets(finder, lexed, path: path)
             vectors += scanSideEffects(finder, lexed, path: path)
             for args in finder.arguments(of: ".package") {
-                if let url = Self.labelled("url", in: args, lexed) {
+                if let registryID = Self.labelled("id", in: args, lexed) {
+                    // Registry dependency (`.package(id: "scope.name", …)`): same
+                    // trust question, a different transport. Pins carry a
+                    // version, not a git revision, so it stays unpinned here.
+                    declared[registryID.lowercased()] = ("registry:\(registryID)", Self.describeRequirement(args, lexed), path)
+                } else if let url = Self.labelled("url", in: args, lexed) {
                     declared[Self.identity(fromURL: url)] = (url, Self.describeRequirement(args, lexed), path)
                 } else if let local = Self.labelled("path", in: args, lexed) {
                     let base = PathText.directory(path)

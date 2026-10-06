@@ -74,6 +74,7 @@ public enum VectorClass: String, Codable, Sendable, CaseIterable, Comparable {
     case buildRule
     case legacyTarget
     case schemeAction
+    case buildSetting              // CC / SWIFT_EXEC / LD…, or compiler-plugin flags, in pbxproj or .xcconfig
     // Integrity
     case unscannableControlFile
 
@@ -84,7 +85,7 @@ public enum VectorClass: String, Codable, Sendable, CaseIterable, Comparable {
         case .gitAttributeDriverDefined, .gitAttributeDriverLatent, .gitSubmoduleInjection: .gitAttributes
         case .manifestEvaluation, .versionSpecificManifest, .manifestSideEffect, .buildToolPlugin,
              .commandPlugin, .macroTarget, .unsafeFlags, .binaryTarget, .remotePackage, .localPackage: .swiftPM
-        case .scriptPhase, .buildRule, .legacyTarget, .schemeAction: .xcodeProject
+        case .scriptPhase, .buildRule, .legacyTarget, .schemeAction, .buildSetting: .xcodeProject
         case .unscannableControlFile: .scanIntegrity
         }
     }
@@ -93,7 +94,7 @@ public enum VectorClass: String, Codable, Sendable, CaseIterable, Comparable {
     /// is approved by what it says, not by what it is called).
     public var isDigestAllowListable: Bool {
         switch self {
-        case .scriptPhase, .buildRule, .legacyTarget, .schemeAction, .gitHook: true
+        case .scriptPhase, .buildRule, .legacyTarget, .schemeAction, .buildSetting, .gitHook: true
         default: false
         }
     }

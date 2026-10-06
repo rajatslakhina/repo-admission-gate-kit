@@ -54,14 +54,35 @@ public enum ClaudeCodeHook {
         }
         guard input.toolName == "Bash", let command = input.toolInput.command else { return nil }
         let base = URL(fileURLWithPath: input.cwd, isDirectory: true)
+        // Git walks UP from the working directory to find its repository, so
+        // the gate must too: `cd Sources && git status` runs the root's
+        // fsmonitor, and a session started in a subdirectory is still inside
+        // the repository. Scanning only the subdirectory would see no `.git`.
         let resolve: @Sendable (String) -> URL = { directory in
-            directory.hasPrefix("/") ? URL(fileURLWithPath: directory) : base.appendingPathComponent(directory).standardizedFileURL
+            let start = directory.hasPrefix("/") ? URL(fileURLWithPath: directory) : base.appendingPathComponent(directory)
+            return repositoryRoot(containing: start.standardizedFileURL)
         }
         let decision = await gate.decide(command, repoKey: { resolve($0).path }, repoAt: { try repoAt(resolve($0)) })
         switch decision.verdict {
         case .allow: return nil
         case .ask, .deny: return render(decision.verdict, decision.reason)
         }
+    }
+
+    /// The nearest directory at or above `directory` that contains a `.git`
+    /// entry (directory or file), or `directory` itself if there is none — in
+    /// which case git has no repository to run hooks from, and the scan of
+    /// `directory` still covers its manifests and projects.
+    public static func repositoryRoot(containing directory: URL) -> URL {
+        var current = directory.standardizedFileURL
+        // Bounded: path depth is finite, and `deletingLastPathComponent` of "/" is "/".
+        for _ in 0..<256 {
+            if FileManager.default.fileExists(atPath: current.appendingPathComponent(".git").path) { return current }
+            let parent = current.deletingLastPathComponent().standardizedFileURL
+            if parent.path == current.path { break }
+            current = parent
+        }
+        return directory.standardizedFileURL
     }
 
     static func render(_ verdict: Verdict, _ reason: String) -> Data? {

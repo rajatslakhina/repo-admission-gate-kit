@@ -78,7 +78,7 @@ public struct Digest: Hashable, Sendable, Comparable, CustomStringConvertible, C
 /// Rejected alternative: CryptoKit / swift-crypto. CryptoKit does not exist on
 /// Linux, and swift-crypto is a remote package — i.e. exactly the kind of
 /// build-time dependency this library asks its users to justify. ~60 lines of
-/// arithmetic, checked against the NIST test vectors in `SHA256Tests`, is the
+/// arithmetic, checked against the NIST test vectors in `DigestTests`, is the
 /// cheaper thing to defend. It is not constant-time and does not need to be:
 /// it hashes public file contents, never secrets.
 enum SHA256 {

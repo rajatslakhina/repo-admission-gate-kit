@@ -107,11 +107,17 @@ public struct ScanLimits: Sendable, Equatable {
     /// `Pods` is deliberately NOT here: `Pods/Pods.xcodeproj` script phases
     /// run in every CocoaPods build.
     public var skippedDirectories: Set<String>
+    /// Ceiling on the bytes read across ALL control files in one scan, so a
+    /// tree of many large-but-individually-legal files cannot pin memory.
+    /// Exceeding it is reported (fail closed), never silently truncated.
+    public var maxTotalBytes: Int
 
     public init(maxFileBytes: Int = 32 * 1024 * 1024,
                 maxEntries: Int = 250_000,
-                skippedDirectories: Set<String> = [".git/objects", ".git/lfs", ".build", "DerivedData", "node_modules", ".swiftpm/cache"]) {
+                skippedDirectories: Set<String> = [".git/objects", ".git/lfs", ".build", "DerivedData", "node_modules", ".swiftpm/cache"],
+                maxTotalBytes: Int = 256 * 1024 * 1024) {
         self.maxFileBytes = max(0, maxFileBytes)
+        self.maxTotalBytes = max(0, maxTotalBytes)
         self.maxEntries = max(0, maxEntries)
         self.skippedDirectories = skippedDirectories
     }

@@ -207,6 +207,23 @@ public struct XcodeProjectScanner: VectorScanner {
                     vectors.append(ExecutionVector(
                         vectorClass: .legacyTarget, subject: "\(object["name"]?.string ?? "?") [\(id)]", path: path,
                         payload: "\(tool) \(args)", firedBy: [.xcodeBuild]))
+                case "XCBuildConfiguration":
+                    guard let settings = object["buildSettings"]?.dictionary else { continue }
+                    let configName = object["name"]?.string ?? "?"
+                    // Conditional keys (`"SWIFT_EXEC[sdk=*]"`) apply too; and one level
+                    // of `$(VAR)` indirection inside this configuration is resolved,
+                    // so `OTHER_SWIFT_FLAGS = $(EVIL)` with `EVIL = -load-plugin…` is seen.
+                    let plain = Dictionary(settings.map { (Self.baseKey($0.key), Self.settingText($0.value)) },
+                                           uniquingKeysWith: { first, second in first + " " + second })
+                    for key in settings.keys.sorted() {
+                        let base = Self.baseKey(key)
+                        let raw = settings[key].map(Self.settingText) ?? ""
+                        let value = Self.expand(raw, in: plain)
+                        guard Self.isExecutingSetting(base, value) || Self.hasUnresolvedFlagReference(base, value) else { continue }
+                        vectors.append(ExecutionVector(
+                            vectorClass: .buildSetting, subject: "\(key) (\(configName)) [\(id)]", path: path,
+                            payload: "\(key) = \(value)", firedBy: [.xcodeBuild]))
+                    }
                 case "XCLocalSwiftPackageReference":
                     let relative = object["relativePath"]?.string ?? ""
                     let projectDirectory = PathText.directory(PathText.directory(path))
@@ -222,6 +239,30 @@ public struct XcodeProjectScanner: VectorScanner {
             }
         }
 
+        for path in context.files(where: { $0.hasSuffix(".xcconfig") }) {
+            guard let text = context.text(path) else { continue }
+            for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                var line = String(rawLine)
+                if let comment = line.range(of: "//") { line = String(line[..<comment.lowerBound]) }
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                // `KEY[sdk=iphoneos*] = value` → KEY
+                let rawKey = String(line[..<eq]).trimmingSpaces()
+                let key = Self.baseKey(rawKey)
+                let value = String(line[line.index(after: eq)...]).trimmingSpaces()
+                guard !key.isEmpty, Self.isExecutingSetting(key, value) else { continue }
+                let number = offset + 1
+                vectors.append(ExecutionVector(
+                    vectorClass: .buildSetting, subject: "\(key) (\(PathText.lastComponent(path)):\(number))", path: path,
+                    lines: number...number, payload: "\(rawKey) = \(value)", firedBy: [.xcodeBuild]))
+            }
+        }
+
+        // Xcode 27.2's JSON project format is not parsed yet. Fail closed:
+        // a project whose build phases we cannot read is reported, not skipped.
+        for path in context.files(where: { PathText.lastComponent($0) == "project.xcproj" }) {
+            context.reportProblem(path: path, detail: "JSON project.xcproj is not parsed by this version; its build phases and settings are unseen")
+        }
+
         for path in context.files(where: { $0.hasSuffix(".xcscheme") }) {
             guard let xml = context.text(path) else { continue }
             for (index, script) in Self.schemeScripts(xml).enumerated() {
@@ -232,6 +273,53 @@ public struct XcodeProjectScanner: VectorScanner {
             }
         }
         return vectors
+    }
+
+    /// Settings that replace the tool Xcode runs.
+    static let toolSettings: Set<String> = ["CC", "CPLUSPLUS", "LD", "LDPLUSPLUS", "LIBTOOL", "SWIFT_EXEC",
+                                            "SWIFT_DRIVER", "CLANG", "AR", "STRIP", "LIPO", "DSYMUTIL"]
+    /// Flag settings that are only a vector when they load compiler plugins.
+    static let flagSettings: Set<String> = ["OTHER_SWIFT_FLAGS", "OTHER_CFLAGS", "OTHER_CPLUSPLUSFLAGS", "OTHER_LDFLAGS",
+                                            "WARNING_CFLAGS", "OTHER_LIBTOOLFLAGS"]
+    static let pluginFlags = ["-load-plugin", "-plugin-path", "-external-plugin-path", "-fplugin", "-fpass-plugin",
+                              "-Xclang -load", "-Xfrontend -load"]
+
+    static func isExecutingSetting(_ key: String, _ value: String) -> Bool {
+        if toolSettings.contains(key) { return !value.isEmpty }
+        if flagSettings.contains(key) { return pluginFlags.contains { value.contains($0) } }
+        return false
+    }
+
+    /// `SWIFT_EXEC[sdk=iphoneos*]` → `SWIFT_EXEC`.
+    static func baseKey(_ key: String) -> String {
+        String(key.prefix(while: { $0 != "[" })).trimmingSpaces()
+    }
+
+    /// Replace `$(NAME)` / `${NAME}` with NAME's value from the same
+    /// configuration (one level; `inherited` is left alone).
+    static func expand(_ value: String, in settings: [String: String]) -> String {
+        var out = value
+        for (name, replacement) in settings where name != "inherited" {
+            out = out.replacingAll("$(\(name))", with: replacement).replacingAll("${\(name)}", with: replacement)
+        }
+        return out
+    }
+
+    /// A flag setting that still references a variable this project file does
+    /// not define (it may come from an xcconfig, the environment or the
+    /// command line): its effective flags cannot be known here. Fail closed.
+    static func hasUnresolvedFlagReference(_ key: String, _ value: String) -> Bool {
+        guard flagSettings.contains(key) else { return false }
+        let stripped = value.replacingAll("$(inherited)", with: "").replacingAll("${inherited}", with: "")
+        return stripped.contains("$(") || stripped.contains("${")
+    }
+
+    static func settingText(_ value: PlistValue) -> String {
+        switch value {
+        case .string(let s): s
+        case .array(let items): items.map(settingText).joined(separator: " ")
+        case .dictionary, .data: ""
+        }
     }
 
     /// The `objects` table of a pbxproj, or nil (reported) if it cannot be parsed.
