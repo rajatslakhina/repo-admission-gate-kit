@@ -36,6 +36,19 @@ final class OpenStepPlistParserTests: XCTestCase {
         XCTAssertEqual(vectors.first?.firedBy, Set(Trigger.allCases))
     }
 
+    func testJSONProjectFormatFailsClosed() throws {
+        let repo = InMemoryRepo(files: ["App.xcodeproj/project.xcproj": "{\"objects\": {}}"])
+        XCTAssertEqual(try RepoScanner.standard.scan(repo).vectors.map(\.vectorClass), [.unscannableControlFile])
+    }
+
+    func testBuildSettingsThatSwapToolsOrLoadPluginsAreVectors() {
+        XCTAssertTrue(XcodeProjectScanner.isExecutingSetting("CC", "/tmp/cc"))
+        XCTAssertTrue(XcodeProjectScanner.isExecutingSetting("OTHER_LDFLAGS", "-Xclang -load -Xclang x.so"))
+        XCTAssertFalse(XcodeProjectScanner.isExecutingSetting("OTHER_SWIFT_FLAGS", "-warnings-as-errors"))
+        XCTAssertFalse(XcodeProjectScanner.isExecutingSetting("SWIFT_VERSION", "6.0"))
+        XCTAssertFalse(XcodeProjectScanner.isExecutingSetting("CC", ""))
+    }
+
     func testSchemeEntitiesAreDecoded() {
         let scripts = XcodeProjectScanner.schemeScripts(#"<A scriptText = "a &amp;&amp; b&#10;c &quot;d&quot;"/><B scriptText='e'/>"#)
         XCTAssertEqual(scripts, ["a && b\nc \"d\"", "e"])
@@ -62,16 +75,39 @@ final class ManifestScannerTests: XCTestCase {
     }
 
     func testUnterminatedConstructsNeverTrap() {
-        for text in ["\"", "#\"", "\"\"\"", "/*", "\"\\(", "\"\\", "#", "\\(", "\"\\(\"\\(\"\\("] {
+        for text in ["\"", "#\"", "\"\"\"", "/*", "\"\\(", "\"\\", "#", "\\(", "\"\\(\"\\(\"\\(", "/", "#/", "x = /"] {
             _ = SwiftLexed(text)
         }
+        XCTAssertEqual(SwiftLexed("\"abc").literals, ["abc"])
+        XCTAssertEqual(SwiftLexed("/* never closed .macro(").codeString, " ")
+    }
+
+    /// Legal Swift spellings that a `name(`-only scanner misses.
+    func testSpacedCallsRegexLiteralsAndRegistryPackages() throws {
+        let manifest = """
+        import PackageDescription
+        let r = /"/; let p = Process()
+        let half = 10 / 2
+        let ext = #/a"b/#
+        let package = Package(name: "X", dependencies: [.package(id: "acme.lib", exact: "1.0.0")],
+            targets: [.macro (name: "M"), .plugin\t(name: "P", capability: .buildTool()),
+                      .target(name: "T", swiftSettings: [.unsafeFlags (["-Xfrontend", "-load-plugin-executable"])])])
+        """
+        let subjects = Set(try RepoScanner.standard.scan(InMemoryRepo(files: ["Package.swift": manifest])).vectors
+            .map { "\($0.vectorClass.rawValue) \($0.subject)" })
+        XCTAssertTrue(subjects.isSuperset(of: ["macroTarget M", "buildToolPlugin P", "manifestSideEffect Process",
+                                               "unsafeFlags -Xfrontend -load-plugin-executable", "remotePackage acme.lib"]),
+                      "\(subjects)")
+        // `.packageX(` is not `.package(`.
+        XCTAssertTrue(CallFinder(code: Array(".packageX(url: 1)")).arguments(of: ".package").isEmpty)
     }
 
     func testComputedPackageGraphFromManifestResolvedAndProject() throws {
         let inventory = try RepoScanner.standard.scan(RedTeamFixture.repo)
         let packages = Dictionary(uniqueKeysWithValues: inventory.vectors.filter { $0.vectorClass == .remotePackage }
             .map { ($0.subject, $0.pinnedRevision) })
-        XCTAssertEqual(packages.keys.sorted(), ["codegen-tools", "swift-format-plugin", "swift-syntax", "telemetry-kit"])
+        XCTAssertEqual(packages.keys.sorted(), ["acme.telemetry", "codegen-tools", "swift-format-plugin", "swift-syntax", "telemetry-kit"])
+        XCTAssertEqual(packages["acme.telemetry"], .some(nil), "a registry package has no git revision to pin")
         XCTAssertEqual(packages["swift-syntax"], RedTeamFixture.swiftSyntaxRevision)
         XCTAssertEqual(packages["codegen-tools"], .some(nil), "branch-tracked and not in Package.resolved: unpinned")
         XCTAssertEqual(packages["swift-format-plugin"], "1111111111111111111111111111111111111111",

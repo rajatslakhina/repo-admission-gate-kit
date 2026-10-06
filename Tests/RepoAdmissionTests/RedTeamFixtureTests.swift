@@ -12,7 +12,7 @@ final class RedTeamFixtureTests: XCTestCase {
         XCTAssertEqual(audit.missing, [], "missed: \(audit.missing)")
         XCTAssertEqual(audit.unexpected, [], "decoys reported: \(audit.unexpected)")
         XCTAssertTrue(audit.passed)
-        XCTAssertEqual(RedTeamFixture.expected.count, 35)
+        XCTAssertEqual(RedTeamFixture.expected.count, 40)
     }
 
     /// The audit must be able to fail. Remove any one family's scanner and the
@@ -47,9 +47,11 @@ final class RedTeamFixtureTests: XCTestCase {
         XCTAssertEqual(audit.unexpected.map(\.subject), ["pre-commit.sample"])
     }
 
-    func testEveryFamilyIsExercised() {
-        let families = Set(RedTeamFixture.expected.map(\.vectorClass.family))
-        XCTAssertEqual(families, Set(VectorFamily.allCases).subtracting([.scanIntegrity]))
+    /// Every family is not just listed in `expected` but actually reported by
+    /// the scanner on the fixture.
+    func testEveryFamilyIsExercised() throws {
+        let scanned = Set(try RepoScanner.standard.scan(RedTeamFixture.repo).vectors.map(\.family))
+        XCTAssertEqual(scanned, Set(VectorFamily.allCases).subtracting([.scanIntegrity]))
     }
 
     func testInventoryDigestIsStableAndContentSensitive() throws {

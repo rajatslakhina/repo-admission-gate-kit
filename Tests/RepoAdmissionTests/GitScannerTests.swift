@@ -29,10 +29,16 @@ final class GitConfigParserTests: XCTestCase {
         XCTAssertEqual(entries[safe: 5]?.value, "a\tb\"c")
     }
 
-    func testMalformedInputNeverTraps() {
+    func testMalformedInputNeverTrapsAndKeysStillSurface() {
         for text in ["[", "[core", "[core \"unterminated", "=", "a = \"unterminated", "a = trailing\\", "\\", "[]", "\n\n\r\n", ""] {
             _ = GitConfigParser.parse(text)
         }
+        // A malformed header does not hide the keys that follow a good one,
+        // and an unterminated quote still yields the value git would read.
+        let entries = GitConfigParser.parse("[core\n[core]\nfsmonitor = \"sh x\n")
+        XCTAssertEqual(entries.map(\.dottedKey), ["core.fsmonitor"])
+        XCTAssertEqual(entries.first?.value, "sh x")
+        XCTAssertEqual(GitConfigParser.parse("a = trailing\\").first?.value, "trailing")
     }
 
     func testExecutableKeyClassification() {
@@ -60,7 +66,33 @@ final class GitScannerTests: XCTestCase {
         let inventory = try RepoScanner.standard.scan(repo)
         XCTAssertEqual(inventory.vectors.map(\.vectorClass), [.gitDirRedirect])
         let inside = InMemoryRepo(files: [".git": "gitdir: .bare\n"])
-        XCTAssertTrue(try RepoScanner.standard.scan(inside).vectors.isEmpty)
+        XCTAssertTrue(try RepoScanner.standard.scan(inside).vectors.isEmpty, "an in-tree gitdir with no config has nothing to report")
+    }
+
+    /// A `.git` *file* pointing at an in-tree directory is where git reads its
+    /// config and hooks from — a scanner that only reads `.git/config` sees nothing.
+    func testInTreeGitdirConfigWorktreeAndCommondirAreScanned() throws {
+        let repo = InMemoryRepo(files: [
+            ".git": "gitdir: meta\n",
+            "meta/config": "[core]\n\tfsmonitor = sh x\n",
+            "meta/config.worktree": "[core]\n\tpager = sh y\n",
+            "meta/hooks/post-checkout": "#!/bin/sh\n",
+            "meta/commondir": "../shared\n",
+            "shared/config": "[diff \"x\"]\n\ttextconv = sh z\n",
+            "shared/hooks/pre-commit": "#!/bin/sh\n",
+            "a.png": "", ".gitattributes": "*.png diff=x\n",
+        ])
+        let found = Set(try RepoScanner.standard.scan(repo).vectors.map { "\($0.vectorClass.rawValue) \($0.subject) @\($0.path)" })
+        XCTAssertEqual(found, [
+            "gitConfigCommand core.fsmonitor @meta/config",
+            "gitConfigCommand core.pager @meta/config.worktree",
+            "gitConfigCommand diff.x.textconv @shared/config",
+            "gitHook post-checkout @meta/hooks/post-checkout",
+            "gitHook pre-commit @shared/hooks/pre-commit",
+            "gitAttributeDriverDefined diff=x @.gitattributes",
+        ])
+        let escaping = InMemoryRepo(files: [".git/config": "", ".git/commondir": "/elsewhere\n"])
+        XCTAssertEqual(try RepoScanner.standard.scan(escaping).vectors.map(\.vectorClass), [.gitDirRedirect])
     }
 
     func testAttributeIsDefinedOnlyWhenTheRepoConfigDefinesAnExecutableDriverKey() throws {

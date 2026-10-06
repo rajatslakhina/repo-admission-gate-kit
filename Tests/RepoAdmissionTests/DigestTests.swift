@@ -38,9 +38,11 @@ final class DigestTests: XCTestCase {
         let a = Digest.of("a"), b = Digest.of("b")
         XCTAssertEqual(Digest.combining([("x", a), ("y", b)], domain: "d"), Digest.combining([("y", b), ("x", a)], domain: "d"))
         XCTAssertNotEqual(Digest.combining([("x", a)], domain: "d"), Digest.combining([("x", a)], domain: "e"))
-        // Without length prefixes these two would serialise identically.
-        XCTAssertNotEqual(Digest.combining([("ab", a), ("c", b)], domain: "d"),
-                          Digest.combining([("a", a), ("bc", b)], domain: "d"))
+        // Without length prefixes, one part whose label smuggles in the
+        // separator and a second line serialises exactly like two parts:
+        // "a=<a>\nb=<b>\n" either way.
+        XCTAssertNotEqual(Digest.combining([("a", a), ("b", b)], domain: "d"),
+                          Digest.combining([("a=\(a.hex)\nb", b)], domain: "d"))
         XCTAssertEqual(Digest.combining([], domain: "d"), Digest.combining([], domain: "d"))
     }
 

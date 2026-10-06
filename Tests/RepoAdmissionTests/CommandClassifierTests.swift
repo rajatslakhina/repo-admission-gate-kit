@@ -49,6 +49,10 @@ final class CommandClassifierTests: XCTestCase {
             "git --git-dir=/tmp/evil status",
             "git config core.fsmonitor 'sh x'",
             "bash -c \"git -c diff.x.textconv=sh diff\"",
+            "git --config-env core.fsmonitor=FOO status",
+            "git config set core.fsmonitor 'sh x'",
+            "git config -f .git/config core.fsmonitor 'sh x'",
+            "git config --file=.git/config core.pager 'sh x'",
         ]
         for command in injected {
             XCTAssertTrue(concerns(command).contains { if case .injection = $0 { true } else { false } }, command)
@@ -70,10 +74,38 @@ final class CommandClassifierTests: XCTestCase {
         XCTAssertEqual(concerns("swift build --disable-sandbox").count, 1)
     }
 
-    func testHostileInputNeverTraps() {
+    func testHostileInputNeverTrapsAndNeverVouches() {
         for command in ["'", "\"", "\\", "&&&&", "|||", ">>>", "2>", "cd", "git -C", "git -c", "env", "xcrun", "xargs",
                         String(repeating: "(", count: 10_000), String(repeating: "sh -c '", count: 50)] {
             _ = CommandClassifier.classify(command)
         }
+        XCTAssertTrue(concerns("'git status").contains(.opaque("unterminated quote")))
+        XCTAssertTrue(concerns("echo \"$(id").contains { if case .opaque = $0 { true } else { false } })
+        XCTAssertFalse(concerns(String(repeating: "sh -c '", count: 50)).isEmpty, "deep nesting is refused, not allowed")
+    }
+
+    /// Shell grammar that hides a git call behind something else. Every one
+    /// of these must still be seen as `git status`.
+    func testCompoundShellSyntaxDoesNotHideGit() {
+        for command in ["if git status; then :; fi", "{ git status; }", "! git status", "for f in a; do git status; done",
+                        "while git status; do break; done", "timeout 60 git status", "timeout -s KILL 5 git status",
+                        "stdbuf -oL git status", "xargs -n 1 git status", "(git status)", "true && (cd . && git status)"] {
+            XCTAssertTrue(triggers(command).contains(.gitIndexRead), command)
+        }
+        XCTAssertEqual(triggers("gh pr checkout 12"), [.gitIndexRead, .gitCheckout, .gitCommit, .gitNetwork])
+        XCTAssertTrue(concerns("env -S 'git status'").contains { if case .opaque = $0 { true } else { false } })
+    }
+
+    func testSubstitutionAnywhereIsOpaque() {
+        for command in ["cat <(git status)", "diff <(ls) >(tee x)", "echo \"$(git status)\"", "echo \"`git status`\""] {
+            XCTAssertTrue(concerns(command).contains { if case .opaque = $0 { true } else { false } }, command)
+        }
+        // The process-substitution body is still classified as a command.
+        XCTAssertTrue(triggers("cat <(git status)").contains(.gitIndexRead))
+    }
+
+    func testSubshellCdDoesNotLeak() {
+        let classified = CommandClassifier.classify("(cd Sources && swift build); git status")
+        XCTAssertEqual(classified.invocations.map(\.directory), ["Sources", "."])
     }
 }

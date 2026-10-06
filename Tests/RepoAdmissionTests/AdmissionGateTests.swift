@@ -131,26 +131,45 @@ final class AdmissionGateTests: XCTestCase {
         XCTAssertEqual(decision.verdict, .ask)
     }
 
-    func testConcurrentDecisionsAndApprovalsKeepTheLogConsistent() async throws {
+    /// Decisions racing an approval must each be made atomically against one
+    /// state. Sixty decisions run concurrently, then the approval, then sixty
+    /// more concurrently: every decision logged before the approval entry must
+    /// be a deny and every one after it an allow — and both sides must be
+    /// non-empty, so a gate that ignored approvals (all deny) or ignored the
+    /// surface (all allow) fails.
+    func testConcurrentDecisionsAreLinearisableAgainstAnApproval() async throws {
         let gate = AdmissionGate(logCapacity: 10_000)
         var repo = RedTeamFixture.repo
         _ = try await gate.sanitize(repo: key, &repo)
         let snapshot = repo
         let surface = await gate.surface(of: try await gate.assess(repo: key, snapshot))
-        let verdicts = await withTaskGroup(of: Verdict.self) { group in
-            for i in 0..<200 {
-                group.addTask { [key] in
-                    if i % 50 == 0 { _ = try? await gate.approve(repo: key, snapshot, expected: surface, approver: "c\(i)") }
-                    return await gate.decide("git status", repoKey: { _ in key }, repoAt: { _ in snapshot }).verdict
+        func burst() async {
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<60 {
+                    group.addTask { [key] in
+                        _ = await gate.decide("swift build", repoKey: { _ in key }, repoAt: { _ in snapshot })
+                    }
                 }
             }
-            return await group.reduce(into: [Verdict]()) { $0.append($1) }
         }
-        XCTAssertEqual(verdicts.count, 200)
-        XCTAssertTrue(verdicts.allSatisfy { $0 == .allow })
+        await burst()
+        try await gate.approve(repo: key, snapshot, expected: surface, approver: "racer")
+        await burst()
         let log = await gate.log
         XCTAssertEqual(log.verify(), .intact(entries: log.entries.count))
-        XCTAssertEqual(log.entries.map(\.sequence), Array(0..<UInt64(log.entries.count)), "no interleaved or lost appends")
+        var approvedYet = false
+        var before = 0, after = 0
+        for entry in log.entries {
+            switch entry.event {
+            case .approved: approvedYet = true
+            case .decided(_, let verdict, _):
+                XCTAssertEqual(verdict, approvedYet ? .allow : .deny, "decision #\(entry.sequence) disagrees with the approval state it was logged under")
+                if approvedYet { after += 1 } else { before += 1 }
+            default: break
+            }
+        }
+        XCTAssertEqual(before, 60)
+        XCTAssertEqual(after, 60)
     }
 
     /// Each hook call is a new process: a persisted log handed to the next

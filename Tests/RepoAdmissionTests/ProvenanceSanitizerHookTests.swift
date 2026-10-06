@@ -70,6 +70,25 @@ final class SanitizerTests: XCTestCase {
             .allSatisfy { $0.vector.vectorClass == .gitAttributeDriverLatent })
     }
 
+    /// `[core] fsmonitor = x` puts a key on its header's line. Deleting that
+    /// line would orphan every key below it into the previous section.
+    func testKeyOnTheHeaderLineIsCutNotDeleted() throws {
+        var repo = InMemoryRepo(files: [".git/config": "[alias]\n\tlg = log\n[core] fsmonitor = evil\n\tbare = false\n\tlogallrefupdates = true\n"])
+        let plan = SanitizationPlan(assessment: AdmissionPolicy.strict.evaluate(try RepoScanner.standard.scan(repo)), repo: repo)
+        try plan.apply(to: &repo)
+        XCTAssertEqual(repo.text(".git/config"), "[alias]\n\tlg = log\n[core]\n\tbare = false\n\tlogallrefupdates = true\n")
+        let keys = GitConfigParser.parse(repo.text(".git/config") ?? "").map(\.dottedKey)
+        XCTAssertEqual(keys, ["alias.lg", "core.bare", "core.logallrefupdates"])
+    }
+
+    func testInTreeGitdirIsSanitizedWhereGitReadsIt() throws {
+        var repo = InMemoryRepo(files: [".git": "gitdir: meta\n", "meta/config": "[core]\n\tfsmonitor = sh x\n",
+                                        "meta/hooks/post-checkout": "#!/bin/sh\n"])
+        let plan = SanitizationPlan(assessment: AdmissionPolicy.strict.evaluate(try RepoScanner.standard.scan(repo)), repo: repo)
+        try plan.apply(to: &repo)
+        XCTAssertTrue(try RepoScanner.standard.scan(repo).vectors.isEmpty)
+    }
+
     func testStalePlanIsRefusedWithoutWritingAnything() throws {
         var repo = RedTeamFixture.repo
         let plan = SanitizationPlan(assessment: AdmissionPolicy.strict.evaluate(try RepoScanner.standard.scan(repo)), repo: repo)
@@ -117,6 +136,23 @@ final class ClaudeCodeHookTests: XCTestCase {
     func testMalformedInputFailsClosed() async {
         let out = decode(await ClaudeCodeHook.respond(to: Data("not json".utf8), gate: AdmissionGate()))
         XCTAssertEqual(out?["permissionDecision"], "deny")
+    }
+
+    /// Git walks up to its repository; so must the gate. A command run in a
+    /// subdirectory is scanned — and keyed — at the repository root.
+    func testSubdirectoryCommandsAreScannedAtTheRepositoryRoot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ra-root-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sub = root.appendingPathComponent("Sources/App")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        try Data("[core]\n\tfsmonitor = sh x\n".utf8).write(to: root.appendingPathComponent(".git/config"))
+        XCTAssertEqual(ClaudeCodeHook.repositoryRoot(containing: sub).path, root.standardizedFileURL.path)
+
+        for (command, cwd) in [("git status", sub.path), ("cd Sources && git status", root.path), ("git -C Sources/App status", root.path)] {
+            let out = decode(await ClaudeCodeHook.respond(to: input(command, cwd: cwd), gate: AdmissionGate()))
+            XCTAssertEqual(out?["permissionDecision"], "deny", "\(command) in \(cwd)")
+        }
     }
 
     func testInvocationDirectoriesResolveAgainstTheHookCwd() async {
