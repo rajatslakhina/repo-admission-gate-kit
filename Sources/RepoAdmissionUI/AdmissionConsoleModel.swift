@@ -76,10 +76,122 @@ public final class AdmissionConsoleModel {
         return approved.surface == surface
     }
 
-    public func refresh() async {
+    /// What the header says. Derived here, not in the view, so the demo's
+    /// headline is tested on Linux against the states the README describes.
+    public enum Status: Equatable, Sendable {
+        case quarantined(denied: Int)
+        case awaitingApproval(pending: Int)
+        /// Approval matches the current surface. `denied` vectors (if any)
+        /// still block exactly the operations that fire them.
+        case admitted(denied: Int)
+        /// An approval exists but the executable surface has changed since.
+        case reQuarantined
+        case clean
+
+        public var headline: String {
+            switch self {
+            case .quarantined: "Quarantined — denied vectors present, nothing approved"
+            case .awaitingApproval: "Awaiting approval"
+            case .admitted(let denied) where denied > 0:
+                "Admitted for approved operations — \(denied) denied vector(s) still block what fires them"
+            case .admitted: "Admitted — approval matches the current surface"
+            case .reQuarantined: "Re-quarantined — the surface changed after approval"
+            case .clean: "Admitted — nothing needs approval"
+            }
+        }
+    }
+
+    public var status: Status {
+        let counts = counts
+        if isApprovalCurrent { return .admitted(denied: counts.blocking) }
+        if approved != nil { return .reQuarantined }
+        if counts.blocking > 0 { return .quarantined(denied: counts.blocking) }
+        if counts.pending > 0 { return .awaitingApproval(pending: counts.pending) }
+        return .clean
+    }
+
+    // Every public action is serialised through `isBusy`. The model is
+    // @MainActor, so the check-and-set below runs before the first suspension
+    // point: a second tap while an action is awaiting the gate is refused
+    // instead of interleaving (e.g. a Pull landing mid-Sanitize and then being
+    // overwritten when Sanitize writes its snapshot back, or Reset swapping
+    // the gate under an in-flight refresh).
+    private func begin() -> Bool {
+        guard !isBusy else { return false }
         isBusy = true
-        defer { isBusy = false }
+        return true
+    }
+
+    @discardableResult
+    public func refresh() async -> Bool {
+        guard begin() else { return false }
+        await reload()
+        isBusy = false
+        return true
+    }
+
+    /// Remove every vector that lives only in git metadata (never a tracked file).
+    @discardableResult
+    public func sanitize() async -> Bool {
+        guard begin() else { return false }
+        var working = repo
+        do {
+            let plan = try await gate.sanitize(repo: repoKey, &working)
+            repo = working
+            lastEvent = plan.isEmpty
+                ? "Nothing left to sanitize in .git/."
+                : "Sanitized .git/: \(plan.actions.count) change(s). \(plan.unsanitizable.count) vector(s) live in tracked files and need approval or a human edit."
+        } catch {
+            lastEvent = "Sanitize refused: \(error)"
+        }
+        await reload()
+        isBusy = false
+        return true
+    }
+
+    /// Approve the surface currently on screen.
+    @discardableResult
+    public func approve() async -> Bool {
+        guard let surface, begin() else { return false }
+        do {
+            try await gate.approve(repo: repoKey, repo, expected: surface, approver: "demo-reviewer")
+            let denied = assessment?.blocking.count ?? 0
+            lastEvent = "Approved surface \(surface.short) — bound to this digest, not the repo's name."
+                + (denied > 0 ? " \(denied) denied vector(s) still block the commands that fire them." : "")
+        } catch {
+            lastEvent = "Approval refused: \(error)"
+        }
+        await reload()
+        isBusy = false
+        return true
+    }
+
+    /// Simulate `git pull` bringing an edited Run Script phase.
+    @discardableResult
+    public func pullUpstreamChange() async -> Bool {
+        guard begin() else { return false }
+        repo = RedTeamFixture.repoAfterUpstreamEdit(repo)
+        lastEvent = "Pulled an upstream commit that edits the Lint script phase. The approval still exists — and no longer matches."
+        await reload()
+        isBusy = false
+        return true
+    }
+
+    @discardableResult
+    public func reset() async -> Bool {
+        guard begin() else { return false }
+        repo = initialRepo
+        gate = AdmissionGate(policy: policy)
+        lastEvent = "Reset to the original red-team fixture."
+        await reload()
+        isBusy = false
+        return true
+    }
+
+    /// Rescan and replay every probe. Only called while `isBusy` is held.
+    private func reload() async {
         let snapshot = repo
+        let gate = gate
         do {
             let assessment = try await gate.assess(repo: repoKey, snapshot)
             self.assessment = assessment
@@ -104,48 +216,5 @@ public final class AdmissionConsoleModel {
         let log = await gate.log
         self.logTail = Array(log.entries.suffix(8).reversed())
         self.chainStatus = log.verify()
-    }
-
-    /// Remove every vector that lives only in `.git/` (never a tracked file).
-    public func sanitize() async {
-        var working = repo
-        do {
-            let plan = try await gate.sanitize(repo: repoKey, &working)
-            repo = working
-            lastEvent = plan.isEmpty
-                ? "Nothing left to sanitize in .git/."
-                : "Sanitized .git/: \(plan.actions.count) change(s). \(plan.unsanitizable.count) vector(s) live in tracked files and need approval or a human edit."
-        } catch {
-            lastEvent = "Sanitize refused: \(error)"
-        }
-        await refresh()
-    }
-
-    /// Approve the surface currently on screen.
-    public func approve() async {
-        guard let surface else { return }
-        do {
-            try await gate.approve(repo: repoKey, repo, expected: surface, approver: "demo-reviewer")
-            let denied = assessment?.blocking.count ?? 0
-            lastEvent = "Approved surface \(surface.short) — bound to this digest, not the repo's name."
-                + (denied > 0 ? " \(denied) denied vector(s) still block the commands that fire them." : "")
-        } catch {
-            lastEvent = "Approval refused: \(error)"
-        }
-        await refresh()
-    }
-
-    /// Simulate `git pull` bringing an edited Run Script phase.
-    public func pullUpstreamChange() async {
-        repo = RedTeamFixture.repoAfterUpstreamEdit(repo)
-        lastEvent = "Pulled an upstream commit that edits the Lint script phase. The approval still exists — and no longer matches."
-        await refresh()
-    }
-
-    public func reset() async {
-        repo = initialRepo
-        gate = AdmissionGate(policy: policy)
-        lastEvent = "Reset to the original red-team fixture."
-        await refresh()
     }
 }

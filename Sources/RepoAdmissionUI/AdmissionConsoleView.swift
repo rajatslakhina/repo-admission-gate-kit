@@ -105,12 +105,14 @@ private struct StatusHeader: View {
     }
 
     private var headline: (text: String, icon: String, color: Color) {
-        let counts = model.counts
-        if counts.blocking > 0 { return ("Quarantined — denied vectors present", "xmark.shield.fill", .red) }
-        if model.isApprovalCurrent { return ("Admitted — approval matches the current surface", "checkmark.shield.fill", .green) }
-        if model.approved != nil { return ("Re-quarantined — the surface changed after approval", "exclamationmark.shield.fill", .orange) }
-        if counts.pending > 0 { return ("Awaiting approval", "shield.lefthalf.filled", .orange) }
-        return ("Admitted — nothing needs approval", "checkmark.shield.fill", .green)
+        let status = model.status
+        switch status {
+        case .quarantined: return (status.headline, "xmark.shield.fill", .red)
+        case .awaitingApproval: return (status.headline, "shield.lefthalf.filled", .orange)
+        case .admitted(let denied): return (status.headline, "checkmark.shield.fill", denied > 0 ? .yellow : .green)
+        case .reQuarantined: return (status.headline, "exclamationmark.shield.fill", .orange)
+        case .clean: return (status.headline, "checkmark.shield.fill", .green)
+        }
     }
 }
 
@@ -131,11 +133,16 @@ private struct ActionButtons: View {
     let model: AdmissionConsoleModel
 
     var body: some View {
-        Button("Sanitize .git/ (never touches tracked files)") { Task { await model.sanitize() } }
-        Button("Approve current surface") { Task { await model.approve() } }
-            .disabled(model.surface == nil)
-        Button("Pull an upstream change to a script phase") { Task { await model.pullUpstreamChange() } }
-        Button("Reset", role: .destructive) { Task { await model.reset() } }
+        Group {
+            Button("Sanitize .git/ (never touches tracked files)") { Task { await model.sanitize() } }
+            Button("Approve current surface") { Task { await model.approve() } }
+                .disabled(model.surface == nil)
+            Button("Pull an upstream change to a script phase") { Task { await model.pullUpstreamChange() } }
+            Button("Reset", role: .destructive) { Task { await model.reset() } }
+        }
+        // One action at a time: the model refuses overlapping actions anyway;
+        // disabling the buttons makes that visible.
+        .disabled(model.isBusy)
     }
 }
 
