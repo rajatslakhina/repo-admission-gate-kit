@@ -30,7 +30,17 @@ PY
     echo "caught $what"; caught=$((caught+1))
   fi
   mv "$file.orig" "$file"
+  # `mv` restores the ORIGINAL mtime, which is older than the mutant's object
+  # file — an incremental build would then keep linking the mutant into every
+  # later run. Touch it so the restored source is always recompiled.
+  touch "$file"
 }
+
+# Baseline: the unmutated tree must build and pass, or every "caught" below
+# would be caught for the wrong reason.
+if ! swift build --build-tests >/dev/null 2>&1 || ! swift test --skip-build >/dev/null 2>&1; then
+  echo "baseline build/test failed on the unmutated tree — fix that first"; exit 2
+fi
 
 S=Sources/RepoAdmission
 mutate $S/Digest.swift 'let s1 = rotr(e, 6)' 'let s1 = rotr(e, 7)' DigestTests \
@@ -54,5 +64,23 @@ mutate $S/GitScanners.swift 'let isCommandValue = entry.value != nil && !boolean
 mutate $S/RepoScanner.swift 'vectors.append(contentsOf: context.problems)' '_ = context.problems' ScanIntegrityTests \
   "unscannable control files silently skipped"
 
+mutate $S/Sanitizer.swift 'drop.remove(lines.lowerBound)' '_ = drop' SanitizerTests \
+  "sanitizer deletes a header line that also holds the key"
+mutate $S/CommandClassifier.swift 'while let (word, dynamic) = words.first, !dynamic, reservedWords.contains(word) {' 'while let (word, dynamic) = words.first, !dynamic, false, reservedWords.contains(word) {' CommandClassifierTests \
+  "shell reserved words (if/!/{/do) hide the git call"
+mutate $S/RepoScanner.swift '                bases.append(normalized)' '                _ = normalized' GitScannerTests \
+  "in-tree gitdir (.git file) not scanned"
+mutate $S/ClaudeCodeHook.swift 'return repositoryRoot(containing: start.standardizedFileURL)' 'return start.standardizedFileURL' ClaudeCodeHookTests \
+  "hook scans the subdirectory instead of the repository root"
+mutate Sources/RepoAdmissionUI/AdmissionConsoleModel.swift 'guard !isBusy else { return false }' 'guard true else { return false }' AdmissionConsoleModelTests \
+  "console model lets overlapping actions interleave"
+
+mutate $S/RepoScanner.swift 'bytes(path).map(Self.normalizedText)' 'bytes(path).map { String(decoding: $0, as: UTF8.self) }' EncodingHardeningTests \
+  "CRLF/BOM not normalised before line-based scanning"
+mutate $S/PackageScanner.swift 'if c == "`" {' 'if false, c == "`" {' EncodingHardeningTests \
+  "backtick-escaped identifiers hide manifest calls"
+
 echo "mutations caught: $caught, missed: $missed"
+# Leave the tree verified clean again.
+swift build --build-tests >/dev/null 2>&1 && swift test --skip-build >/dev/null 2>&1 || { echo "post-run baseline failed"; exit 3; }
 [ "$missed" -eq 0 ]
